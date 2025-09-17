@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "INFO901 Middleware"
+version = "0.0.1"
+authors = [
+  { name="Mauti Enzo", email="enzo.mauti@etu.univ-smb.fr" },
+]
+description = "A small Middleware package for the course of INFO901: Distributed Algorithm"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+
+[project.urls]
+Homepage = "https://github.com/Poutchy/INFO901"
+Issues = "https://github.com/Poutchy/INFO901/issues"
+
