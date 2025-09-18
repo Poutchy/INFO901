@@ -7,7 +7,7 @@ def launch(nbProcess, runningTime=5):
     processes = []
 
     for i in range(nbProcess):
-        processes = processes + [Process("P" + str(i), nbProcess)]
+        processes = processes + [Process("P" + str(i))]
 
     sleep(runningTime)
 
