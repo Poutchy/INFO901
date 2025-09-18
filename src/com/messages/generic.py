@@ -5,5 +5,5 @@ class Message:
         super().__init__()
         self.sender = sender
 
-    def getSender(self) -> int:
+    def get_sender(self) -> int:
         return self.sender

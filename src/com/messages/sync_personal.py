@@ -1,7 +1,7 @@
 from com.messages.communication import CommunicationMessage
 
 
-class PersonalMessage(CommunicationMessage):
+class SyncPersonalMessage(CommunicationMessage):
     """Class for messages to one persone only"""
 
     def __init__(self, sender: int, clock: int, message: str, dest: int):
@@ -10,6 +10,3 @@ class PersonalMessage(CommunicationMessage):
 
     def get_dest(self) -> int:
         return self.dest
-
-    def __repr__(self) -> str:
-        return f"{super().__repr__()} to {self.get_dest()}"
