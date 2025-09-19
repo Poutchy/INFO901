@@ -2,14 +2,16 @@
 Communication module
 """
 
-from threading import Lock
+from threading import Condition, Lock, Thread
 from typing import Optional
+from uuid import uuid4
 
-from pyeventbus3.pyeventbus3 import Mode, PyBus, subscribe
+from pyeventbus3.pyeventbus3 import Mode, PyBus, subscribe, time
 
 from com.mailbox.mailbox import MailBox
 from com.messages.broadcast_response import BroadcastSyncResponse
 from com.messages.multiple import MultipleMessage
+from com.messages.numerotation import Numerotation
 from com.messages.personal import PersonalMessage
 from com.messages.personal_response import PersonalSyncResponse
 from com.messages.sync_multiple import SyncMultipleMessage
@@ -21,28 +23,28 @@ from com.messages.token import TokenMessage
 class Com:
     """Communicator class"""
 
-    nbProcessCreated = 0
-    mutexNbProcesses = Lock()
-    mutexProcesses = Lock()
-
     def __init__(self):
         super().__init__()
         self.alive = True
 
-        # token parameters
-        self.want_token: Lock = Lock()
-        self.release_token: Lock = Lock()
-
         # ID parameters
-        self.my_id = None
-        self.set_id()
+        self.temp_id: str = str(uuid4())
+        self.registry: dict[str, int] = {}
+        self.registry_lock: Lock = Lock()
+        self.my_id: Optional[int] = None
+
         PyBus.Instance().register(self, self)
         self.mailbox: MailBox = MailBox()
         self.clock = 0
 
+        # token parameters
+        self.token_started: bool = False
+        self.want_token: Lock = Lock()
+        self.release_token: Lock = Lock()
+
         # Synchronisation parameters
-        self.awaiters: list[int] = []
-        self.await_synchronisation: Lock = Lock()
+        self.awaiters: set[int] = set()
+        self.await_synchronisation: Condition = Condition()
 
         # Broadcast Sync parameters
         self.broadcast_lock: Lock = Lock()
@@ -50,12 +52,35 @@ class Com:
         self.broadcast_message: Optional[str] = None
         self.broadcast_awaiters: list[int] = []
 
-        # Broadcast Sync parameters
-        self.await_direct: Lock = Lock()
+        # Direct Sync parameters
         self.received_from: list[tuple[int, str]] = []
+        self.await_direct: Condition = Condition()
 
-        if self.my_id == 2:
-            self.send_token()
+        self.announce()
+        # if self.my_id == 2:
+        #     self.send_token()
+
+    def announce(self):
+        """Function to announce our existence in the network"""
+        PyBus.Instance().post(Numerotation(self.temp_id))
+
+    def update_ids(self):
+        """Automatic numerotation of the communicators
+        note pour le professeur:
+        à cause de la réussite d'implémentation tardive, seulement les fonctions de broadcast et de synchronisation fonctionne avec ce modèle. Pour avoir accès aux fonctions qui fonctionnent MAIS qui n'ont pas la numérotation automatique, regardez le commit précédent
+        """
+        with self.registry_lock:
+            sorted_ids = sorted(self.registry.keys())
+            for idx, tid in enumerate(sorted_ids):
+                self.registry[tid] = idx
+            self.my_id = self.registry[self.temp_id]
+            if self.my_id == 0 and not self.token_started:
+                self.token_started = True
+                Thread(target=self._start_token_after_init, daemon=True).start()
+
+    def _start_token_after_init(self):
+        time.sleep(0.5)
+        self.send_token()
 
     def get_my_id(self) -> int:
         """Getter for the Communicator id
@@ -71,18 +96,12 @@ class Com:
         :returns: The id of the current communicator
         :rtype: int
         """
-        with Com.mutexNbProcesses:
-            res = Com.nbProcessCreated
-        return res
-
-    def set_id(self):
-        if self.my_id is None:
-            with Com.mutexNbProcesses:
-                res = Com.nbProcessCreated
-                Com.nbProcessCreated += 1
-            self.my_id = res
+        return len(self.registry)
 
     def stop(self):
+        """Function that stop the rounds of the token
+        ALWAYS FINISH ALL PROCESS BY THAT FUNCTION BEFORE DYING
+        """
         self.alive = False
 
     def request_s_c(self):
@@ -157,8 +176,6 @@ class Com:
         :type message: str
         :param dest: The id of the communicator
         :type dest: int
-        return: True if the message was well sent, False otherwise
-        :rtype: bool
         """
         # print(f"send message from {self.my_id} to {dest}")
         self.await_direct.acquire()
@@ -168,7 +185,13 @@ class Com:
         # print("finish sending the message")
 
     def recev_from_sync(self, message: list[str], fromm: int):
-        # print(f"start receive message to {self.my_id} to {fromm}")
+        """Receive a synchronous message from another Communicator
+
+        :param message: A list that contains the message in it's last position
+        :type message: list[str]
+        :param dest: The id of the communicator
+        :type dest: int
+        """
         self.await_direct.acquire()
         if fromm in [indices for (indices, _) in self.received_from]:
             element = next(
@@ -200,37 +223,60 @@ class Com:
             self.await_direct.acquire()
 
     def synchronize(self):
-        self.clock += 1
-        self.await_synchronisation.acquire()
-        all_users = set(list(range(self.get_nb_process())))
-        self.awaiters.append(self.my_id)
-        if set(self.awaiters) == all_users:
-            self.await_synchronisation.release()
-            self.awaiters = []
-        m = SyncResponse(self.my_id)
-        PyBus.Instance().post(m)
+        """Method to synchronize all the Processes of the program
+        ALL PROCESSES HAVE TO RUN THE COMMAND ONE TIME OR ANOTHER
+        """
+        with self.await_synchronisation:
+            m = SyncResponse(self.my_id)
+            PyBus.Instance().post(m)
+            while True:
+                with self.registry_lock:
+                    expected_users = set(self.registry.values())
+                print(expected_users)
+
+                if expected_users.issubset(self.awaiters):
+                    break
+                self.await_synchronisation.wait()
+            self.awaiters.clear()
+
+        # self.await_synchronisation.acquire()
+        # self.clock += 1
+        # all_users = set(list(range(self.get_nb_process())))
+        # print(all_users)
+        # self.awaiters.append(self.my_id)
+        # if set(self.awaiters) == all_users:
+        #     self.awaiters = []
+        #     self.await_synchronisation.release()
+        # m = SyncResponse(self.my_id)
+        # PyBus.Instance().post(m)
 
     def send_token(self):
-        with Com.mutexNbProcesses:
-            dest = (self.my_id + 1) % Com.nbProcessCreated
+        """Utilisty function that make the token make rounds in all processes
+        NEVER USE THAT FUNCTION
+        """
+        nb = self.get_nb_process()
+        dest = (self.my_id + 1) % nb
         m = TokenMessage(self.my_id, dest)
         PyBus.Instance().post(m)
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=MultipleMessage)
     def on_broadcast(self, event: MultipleMessage):
+        """Subscriber to the MultipleMessage, sent by broadcast"""
         if self.my_id in event.get_dests():
             self.clock = 1 + max(self.clock, event.get_clock())
             self.mailbox.add_msg(event)
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=PersonalMessage)
     def on_receive(self, event):
+        """Subscriber to the PersonalMessage, sent by send_to"""
         if self.my_id == event.dest:
             self.clock = 1 + max(self.clock, event.get_clock())
             self.mailbox.add_msg(event)
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=TokenMessage)
     def on_token_receive(self, event):
-        """Subscriber to the TokenMessage reception"""
+        """Subscriber to the TokenMessage reception, sent by send_token"""
+        self.token_started = True
         if self.my_id == event.get_dest():
             if self.want_token.locked():
                 self.want_token.release()
@@ -246,16 +292,21 @@ class Com:
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=SyncResponse)
     def on_sync_response(self, event: SyncResponse):
-        if self.my_id == event.get_sender():
-            return
-        all_users = list(range(self.get_nb_process()))
-        self.awaiters.append(event.get_sender())
-        if set(self.awaiters) == set(all_users):
-            self.await_synchronisation.release()
-            self.awaiters = []
+        """Subscriber to the SyncResponse, sent by synchronise"""
+        with self.await_synchronisation:
+            self.awaiters.add(event.get_sender())
+            self.await_synchronisation.notify_all()
+        # if self.my_id == event.get_sender():
+        #     return
+        # all_users = list(range(self.get_nb_process()))
+        # self.awaiters.append(event.get_sender())
+        # if set(self.awaiters) == set(all_users):
+        #     self.await_synchronisation.release()
+        #     self.awaiters = []
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=SyncMultipleMessage)
     def on_broadcast_sync(self, event: SyncMultipleMessage):
+        """Subscriber to the SyncMultipleMessage, sent by broadcast_sync"""
         if self.my_id in event.get_dests():
             self.clock = 1 + max(self.clock, event.get_clock())
             self.broadcast_message = event.get_message()
@@ -266,6 +317,7 @@ class Com:
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=SyncPersonalMessage)
     def on_receive_sync(self, event: SyncPersonalMessage):
+        """Subscriber to the SyncPersonalMessage, sent by send_to_sync"""
         if self.my_id == event.get_dest():
             self.clock = 1 + max(self.clock, event.get_clock())
             temp = (event.get_sender(), event.get_message())
@@ -275,6 +327,7 @@ class Com:
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=BroadcastSyncResponse)
     def on_broadcast_response(self, event: BroadcastSyncResponse):
+        """Subscriber to the BroadcastSyncResponse, sent by the SyncMultipleMessage subscriber"""
         if self.my_id == event.get_emiter():
             all_users = list(range(self.get_nb_process()))
             self.broadcast_awaiters.append(event.get_sender())
@@ -284,5 +337,16 @@ class Com:
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=PersonalSyncResponse)
     def on_personal_response(self, event: PersonalSyncResponse):
+        """Subscriber to the PersonalSyncResponse, sent by the SyncPersonalMessage subscriber"""
         if self.my_id == event.get_emiter():
             self.await_direct.release()
+
+    @subscribe(threadMode=Mode.PARALLEL, onEvent=Numerotation)
+    def on_numerotation(self, event: Numerotation):
+        """Subscriber for the Numerotation, sent by set_id"""
+        with self.registry_lock:
+            if event.sender not in self.registry:
+                self.registry[event.sender] = -1
+            if self.temp_id not in self.registry:
+                self.registry[self.temp_id] = -1
+        self.update_ids()

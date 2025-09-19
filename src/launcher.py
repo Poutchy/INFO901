@@ -1,6 +1,6 @@
 from time import sleep
 
-from process import Process
+from direct_process import Process
 
 
 def launch(nbProcess, runningTime=5):
