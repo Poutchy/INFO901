@@ -30,9 +30,8 @@ class Com:
         self.alive = True
 
         # token parameters
-        self.need_token: Lock = Lock()
-        self.await_token: Lock = Lock()
-        self.await_token_release: Lock = Lock()
+        self.want_token: Lock = Lock()
+        self.release_token: Lock = Lock()
 
         # ID parameters
         self.my_id = None
@@ -87,16 +86,15 @@ class Com:
         self.alive = False
 
     def request_s_c(self):
-        """Function to start a critical section
-        DO NOT USE IT AFTER THE release_s_c() call that match it, or it will break
-        """
-        self.await_token.acquire()
+        """Function to start a critical section"""
+        self.release_token.acquire()
+        print("I want the token")
+        self.want_token.acquire()
 
     def release_s_c(self):
-        """Function that end a critical section
-        DO NOT USE IT AFTER THE request_s_c() call that match it, or it will break
-        """
-        self.need_token.release()
+        """Function that end a critical section"""
+        self.release_token.release()
+        print("I don't want the token anymore")
 
     def broadcast(self, message: str):
         """Send an asynchronous message to every other Communicator
@@ -234,13 +232,17 @@ class Com:
     def on_token_receive(self, event):
         """Subscriber to the TokenMessage reception"""
         if self.my_id == event.get_dest():
-            if self.await_token.locked():
-                self.await_token.release()
-                # print("block time")
-                self.need_token.acquire()
-            with self.need_token:
-                if self.alive:
-                    self.send_token()
+            if self.want_token.locked():
+                self.want_token.release()
+                print("I have the token and I want to keep it")
+                with self.release_token:
+                    if self.alive:
+                        print("I don't want the token anymore, here it is")
+                        self.send_token()
+                    else:
+                        print("J'ai le token mais je suis mort...")
+            else:
+                self.send_token()
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=SyncResponse)
     def on_sync_response(self, event: SyncResponse):
