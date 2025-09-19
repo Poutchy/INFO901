@@ -1,4 +1,5 @@
 from collections import deque
+from threading import Lock
 from typing import Optional
 
 from com.messages.communication import CommunicationMessage
@@ -9,10 +10,13 @@ class MailBox:
 
     def __init__(self):
         super().__init__()
+        self.protection_lock: Lock = Lock()
         self.msgs: deque[CommunicationMessage] = deque()
 
     def is_empty(self) -> bool:
-        return len(self.msgs) == 0
+        with self.protection_lock:
+            print(f"will say {len(self.msgs) == 0}")
+            return len(self.msgs) == 0
 
     def get_msg(self) -> CommunicationMessage:
         """Function that answer with the first message of the MailBox
@@ -23,7 +27,10 @@ class MailBox:
         """
         if self.is_empty():
             raise IndexError()
-        return self.msgs.popleft()
+        with self.protection_lock:
+            res = self.msgs.popleft()
+            return res
 
     def add_msg(self, message: CommunicationMessage):
-        return self.msgs.append(message)
+        with self.protection_lock:
+            return self.msgs.append(message)

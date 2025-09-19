@@ -2,16 +2,20 @@
 Communication module
 """
 
-from collections import deque
 from threading import Lock
+from typing import Optional
 
 from pyeventbus3.pyeventbus3 import Mode, PyBus, subscribe
 
 from com.mailbox.mailbox import MailBox
-from com.messages.generic import Message
+from com.messages.broadcast_response import BroadcastSyncResponse
 from com.messages.multiple import MultipleMessage
 from com.messages.personal import PersonalMessage
+from com.messages.personal_response import PersonalSyncResponse
+from com.messages.sync_multiple import SyncMultipleMessage
 from com.messages.sync_personal import SyncPersonalMessage
+from com.messages.sync_response import SyncResponse
+from com.messages.token import TokenMessage
 
 
 class Com:
@@ -23,19 +27,36 @@ class Com:
 
     def __init__(self):
         super().__init__()
+        self.alive = True
 
+        # token parameters
+        self.need_token: Lock = Lock()
+        self.await_token: Lock = Lock()
+        self.await_token_release: Lock = Lock()
+
+        # ID parameters
         self.my_id = None
         self.set_id()
         PyBus.Instance().register(self, self)
         self.mailbox: MailBox = MailBox()
         self.clock = 0
-        self.keep_token: bool = False
-        self.have_token = False
 
-        self.global_lock: Lock = Lock()
+        # Synchronisation parameters
+        self.awaiters: list[int] = []
+        self.await_synchronisation: Lock = Lock()
 
-        self.sync_messages: deque[Message] = deque()
-        self.access_sync_messages: Lock = Lock()
+        # Broadcast Sync parameters
+        self.broadcast_lock: Lock = Lock()
+        self.await_broadcast: Lock = Lock()
+        self.broadcast_message: Optional[str] = None
+        self.broadcast_awaiters: list[int] = []
+
+        # Broadcast Sync parameters
+        self.await_direct: Lock = Lock()
+        self.received_from: list[tuple[int, str]] = []
+
+        if self.my_id == 2:
+            self.send_token()
 
     def get_my_id(self) -> int:
         """Getter for the Communicator id
@@ -62,11 +83,20 @@ class Com:
                 Com.nbProcessCreated += 1
             self.my_id = res
 
+    def stop(self):
+        self.alive = False
+
     def request_s_c(self):
-        self.keep_token = True
+        """Function to start a critical section
+        DO NOT USE IT AFTER THE release_s_c() call that match it, or it will break
+        """
+        self.await_token.acquire()
 
     def release_s_c(self):
-        self.keep_token = False
+        """Function that end a critical section
+        DO NOT USE IT AFTER THE request_s_c() call that match it, or it will break
+        """
+        self.need_token.release()
 
     def broadcast(self, message: str):
         """Send an asynchronous message to every other Communicator
@@ -77,10 +107,36 @@ class Com:
         :rtype: bool
         """
         dests = list(range(self.get_nb_process()))
+        dests.remove(self.my_id)
         self.clock += 1
         m = MultipleMessage(self.my_id, self.clock, message, dests)
-        print(f"{self.my_id} broadcast {m} with clock {self.clock}")
         PyBus.Instance().post(m)
+
+    def broadcast_sync(self, message: list[str], sender: int):
+        """Send a synchronous message to every other Communicator
+
+        :param message: The string to send to the communicator
+        :type message: str
+        return: True if the message was well sent, False otherwise
+        :rtype: bool
+        """
+        self.broadcast_lock.acquire()
+        if self.my_id == sender:
+            self.broadcast_awaiters.append(self.my_id)
+            dests = list(range(self.get_nb_process()))
+            dests.remove(self.my_id)
+            self.clock += 1
+            m = SyncMultipleMessage(self.my_id, self.clock, message[0], dests)
+            PyBus.Instance().post(m)
+        if self.my_id != sender:
+            if self.broadcast_message is not None:
+                message.append(self.broadcast_message)
+                self.broadcast_lock.release()
+                self.broadcast_message = None
+                return
+            with self.broadcast_lock:
+                message.append(self.broadcast_message)
+                self.broadcast_message = None
 
     def send_to(self, message: str, dest: int):
         """Send an asynchronous message to another Communicator
@@ -94,11 +150,10 @@ class Com:
         """
         self.clock += 1
         m = PersonalMessage(self.my_id, self.clock, message, dest)
-        print(f"Personal {self.my_id} send: {m} to {dest}")
         PyBus.Instance().post(m)
 
     def send_to_sync(self, message: str, dest: int):
-        """Send a synchronous message to another Communicator
+        """Send an asynchronous message to another Communicator
 
         :param message: The string to send to the communicator
         :type message: str
@@ -107,27 +162,67 @@ class Com:
         return: True if the message was well sent, False otherwise
         :rtype: bool
         """
+        # print(f"send message from {self.my_id} to {dest}")
+        self.await_direct.acquire()
         self.clock += 1
-        m = PersonalMessage(self.my_id, self.clock, message, dest)
-        print(f"Personal {self.my_id} send: {m} to {dest}")
+        m = SyncPersonalMessage(self.my_id, self.clock, message, dest)
         PyBus.Instance().post(m)
-        with self.access_sync_messages:
-            self.sync_messages.append(m)
+        # print("finish sending the message")
+
+    def recev_from_sync(self, message: list[str], fromm: int):
+        # print(f"start receive message to {self.my_id} to {fromm}")
+        self.await_direct.acquire()
+        if fromm in [indices for (indices, _) in self.received_from]:
+            element = next(
+                (item for item in self.received_from if item[0] == fromm), None
+            )
+            self.received_from = [
+                item for item in self.received_from if item[0] != fromm
+            ]
+            _, m = element
+            message.append(m)
+            self.await_direct.release()
+            m = PersonalSyncResponse(self.my_id, fromm)
+            PyBus.Instance().post(m)
+            return
+        while True:
+            with self.await_direct:
+                if fromm in [indices for (indices, _) in self.received_from]:
+                    element = next(
+                        (item for item in self.received_from if item[0] == fromm), None
+                    )
+                    self.received_from = [
+                        item for item in self.received_from if item[0] != fromm
+                    ]
+                    _, m = element
+                    message.append(m)
+                    m = PersonalSyncResponse(self.my_id, fromm)
+                    PyBus.Instance().post(m)
+                    return
+            self.await_direct.acquire()
 
     def synchronize(self):
-        raise NotImplementedError()
+        self.clock += 1
+        self.await_synchronisation.acquire()
+        all_users = set(list(range(self.get_nb_process())))
+        self.awaiters.append(self.my_id)
+        if set(self.awaiters) == all_users:
+            self.await_synchronisation.release()
+            self.awaiters = []
+        m = SyncResponse(self.my_id)
+        PyBus.Instance().post(m)
 
-    def recev_from_sync(self, message: list[str], sender: int) -> str:
-        raise NotImplementedError()
+    def send_token(self):
+        with Com.mutexNbProcesses:
+            dest = (self.my_id + 1) % Com.nbProcessCreated
+        m = TokenMessage(self.my_id, dest)
+        PyBus.Instance().post(m)
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=MultipleMessage)
     def on_broadcast(self, event: MultipleMessage):
-        if self.get_my_id() != event.get_sender():
+        if self.my_id in event.get_dests():
             self.clock = 1 + max(self.clock, event.get_clock())
             self.mailbox.add_msg(event)
-            print(
-                f"{self.my_id} received broadcast {event.get_message()} from {event.get_sender()} with clock {self.clock}"
-            )
 
     @subscribe(threadMode=Mode.PARALLEL, onEvent=PersonalMessage)
     def on_receive(self, event):
@@ -135,10 +230,57 @@ class Com:
             self.clock = 1 + max(self.clock, event.get_clock())
             self.mailbox.add_msg(event)
 
-    @subscribe(threadMode=Mode.PARALLEL, onEvent=SyncPersonalMessage)
-    def on_sync_receive(self, event):
-        if self.my_id == event.dest:
+    @subscribe(threadMode=Mode.PARALLEL, onEvent=TokenMessage)
+    def on_token_receive(self, event):
+        """Subscriber to the TokenMessage reception"""
+        if self.my_id == event.get_dest():
+            if self.await_token.locked():
+                self.await_token.release()
+                # print("block time")
+                self.need_token.acquire()
+            with self.need_token:
+                if self.alive:
+                    self.send_token()
+
+    @subscribe(threadMode=Mode.PARALLEL, onEvent=SyncResponse)
+    def on_sync_response(self, event: SyncResponse):
+        if self.my_id == event.get_sender():
+            return
+        all_users = list(range(self.get_nb_process()))
+        self.awaiters.append(event.get_sender())
+        if set(self.awaiters) == set(all_users):
+            self.await_synchronisation.release()
+            self.awaiters = []
+
+    @subscribe(threadMode=Mode.PARALLEL, onEvent=SyncMultipleMessage)
+    def on_broadcast_sync(self, event: SyncMultipleMessage):
+        if self.my_id in event.get_dests():
             self.clock = 1 + max(self.clock, event.get_clock())
-            print(
-                f"{self.my_id} received personal {event.get_message()} from {event.get_sender()} with clock {self.clock}"
-            )
+            self.broadcast_message = event.get_message()
+            if self.broadcast_lock.locked():
+                self.broadcast_lock.release()
+            m = BroadcastSyncResponse(self.my_id, event.get_sender())
+            PyBus.Instance().post(m)
+
+    @subscribe(threadMode=Mode.PARALLEL, onEvent=SyncPersonalMessage)
+    def on_receive_sync(self, event: SyncPersonalMessage):
+        if self.my_id == event.get_dest():
+            self.clock = 1 + max(self.clock, event.get_clock())
+            temp = (event.get_sender(), event.get_message())
+            self.received_from.append(temp)
+            if self.await_direct.locked():
+                self.await_direct.release()
+
+    @subscribe(threadMode=Mode.PARALLEL, onEvent=BroadcastSyncResponse)
+    def on_broadcast_response(self, event: BroadcastSyncResponse):
+        if self.my_id == event.get_emiter():
+            all_users = list(range(self.get_nb_process()))
+            self.broadcast_awaiters.append(event.get_sender())
+            if set(self.broadcast_awaiters) == set(all_users):
+                self.broadcast_lock.release()
+                self.broadcast_awaiters = []
+
+    @subscribe(threadMode=Mode.PARALLEL, onEvent=PersonalSyncResponse)
+    def on_personal_response(self, event: PersonalSyncResponse):
+        if self.my_id == event.get_emiter():
+            self.await_direct.release()
