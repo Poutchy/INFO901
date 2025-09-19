@@ -44,7 +44,9 @@ class Process(Thread):
                 print("P0 synchronised")
 
                 self.com.request_s_c()
+                print("I WANT TO HAVE ACCES AND I TAKE IT BLABLABLA")
                 if self.com.mailbox.is_empty():
+                    print("prout")
                     print("Catched !")
                     self.com.broadcast("J'ai gagné !!!")
                 else:
